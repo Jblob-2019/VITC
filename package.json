@@ -1,0 +1,12 @@
+{
+  "name": "aegis-networking",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Predictive Self-Healing IoT Mesh — single repo: ESP32 firmware + Node backend + React dashboard",
+  "scripts": {
+    "start": "node start.mjs",
+    "backend": "npm --prefix server start",
+    "frontend": "npm --prefix web run dev",
+    "build": "npm --prefix web run build"
+  }
+}
