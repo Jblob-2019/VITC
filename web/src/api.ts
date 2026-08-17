@@ -1,62 +1,61 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
-import type { Telemetry, RouteMode, LogLine } from './types';
+// api.ts — WS stream from /ws. Exposes tick + tick src/target + simple stats.
 
-// Default positions if /positions.json is missing — Buoy/Vessel layout.
-export const DEFAULT_POSITIONS = [
-  { id: 0, name: 'Buoy-GW',  x: 500, y: 220, role: 2 as const },
-  { id: 1, name: 'Vessel-1', x: 250, y: 110, role: 1 as const },
-  { id: 2, name: 'Buoy-2',   x: 120, y: 380, role: 0 as const },
-  { id: 3, name: 'Vessel-3', x: 760, y: 130, role: 1 as const },
-  { id: 4, name: 'Buoy-4',   x: 880, y: 380, role: 0 as const },
-];
+import { useEffect, useState } from 'react';
+import type { TickPayload } from './types';
 
-export function useMeshSocket() {
-  const [telemetry, setTelemetry] = useState<Map<number, Telemetry>>(new Map());
-  const [mode, setMode] = useState<RouteMode>(0);
-  const [status, setStatus] = useState<'connecting' | 'open' | 'closed'>('connecting');
-  const [logs, setLogs] = useState<LogLine[]>([]);
-  const wsRef = useRef<WebSocket | null>(null);
+let socket: WebSocket | null = null;
+let stats = { sent: { rssi: 0, etx: 0 }, delivered: { rssi: 0, etx: 0 } };
+let retryTimer: number | null = null;
+const tickSubs = new Set<(p: TickPayload) => void>();
+const statsSubs = new Set<(s: typeof stats) => void>();
 
-  const log = useCallback((level: LogLine['level'], text: string) => {
-    setLogs((prev) => {
-        const next = [...prev, { ts: Date.now(), level, text }];
-        return next.slice(-200);
-    });
-  }, []);
+function openSocket() {
+  if (socket && socket.readyState <= WebSocket.OPEN) return;
+  if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  socket = new WebSocket(`${proto}//${location.host}/ws`);
+  socket.onmessage = (ev) => {
+    let m: any;
+    try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.cmd === 'stats_reset') {
+      stats = { sent: { rssi: 0, etx: 0 }, delivered: { rssi: 0, etx: 0 } };
+      statsSubs.forEach((cb) => cb(stats));
+      return;
+    }
+    if (m.cmd !== 'tick') return;
+    tickSubs.forEach((cb) => cb(m as TickPayload));
+  };
+  socket.onclose = () => { retryTimer = window.setTimeout(openSocket, 1000); };
+  socket.onerror = () => { /* close handler will reschedule */ };
+  socket.onopen = () => { if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; } };
+}
+openSocket();
 
+export function useMeshStream(): { tick: TickPayload | null; stats: typeof stats } {
+  const [tick, setTick] = useState<TickPayload | null>(null);
+  const [s, setS] = useState(stats);
   useEffect(() => {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${proto}://${location.host}/ws`;
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
-
-    ws.onopen = () => { setStatus('open'); log('good', 'WS open'); };
-    ws.onclose = () => { setStatus('closed'); log('bad', 'WS closed'); };
-    ws.onerror = () => log('warn', 'WS error');
-    ws.onmessage = (ev) => {
-      let msg: any;
-      try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.cmd === 'mode') {
-        setMode(msg.route_mode);
-        log('info', `MODE:${msg.mode}`);
-        return;
-      }
-      if ('id' in msg) {
-        setTelemetry((prev) => {
-          const next = new Map(prev);
-          next.set(msg.id, msg);
-          return next;
-        });
-        log('recv', `#${msg.id} bat=${msg.bat}% nb=${msg.nb} mode=${msg.mode === 0 ? 'RSSI' : 'ETX'}`);
-      }
+    tickSubs.add(setTick as any);
+    statsSubs.add(setS);
+    return () => {
+      tickSubs.delete(setTick as any);
+      statsSubs.delete(setS);
     };
-    return () => ws.close();
-  }, [log]);
+  }, []);
+  return { tick, stats: s };
+}
 
-  const setRouteMode = useCallback((m: 'RSSI' | 'ETX') => {
-    wsRef.current?.send(JSON.stringify({ cmd: 'set_mode', mode: m }));
-    log('send', `set_mode → ${m}`);
-  }, [log]);
+export function send(msg: any) {
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
+}
 
-  return { telemetry, mode, status, logs, setRouteMode, log };
+export function reportTick(mode: 'rssi' | 'etx', explored: number, delivered: boolean) {
+  stats.sent[mode] += 1;
+  if (delivered) stats.delivered[mode] += 1;
+  statsSubs.forEach((cb) => cb(stats));
+}
+
+export function resetClientStats() {
+  stats = { sent: { rssi: 0, etx: 0 }, delivered: { rssi: 0, etx: 0 } };
+  statsSubs.forEach((cb) => cb(stats));
 }
