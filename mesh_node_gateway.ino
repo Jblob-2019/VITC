@@ -1,22 +1,13 @@
 // =============================================================================
-//  mesh_node.ino  —  Predictive Self-Healing Maritime Mesh  (single-file)
+//  mesh_node_gateway.ino  —  gateway variant of mesh_node.ino.
 //
-//  Revision 2 — bug fixes + robustness:
-//   * ack_cnt now updates on incoming ACKs → ETX actually converges
-//   * PMA* uses cached route for non-critical traffic, fresh search on CRITICAL
-//   * Buffer drain rewrites file with unsent tail (no data loss)
-//   * ESP-NOW peer entry removed when a neighbour ages out
-//   * Boot button at reset now really forces GATEWAY_ID=MY_ID
-//   * portYIELD_FROM_ISR added; inbox_q dead code removed
-//   * Periodic battery re-read (every 30 s)
-//   * dedup key uses 24 bits of seq to cut collision odds
-//   * Telemetry prints as floats, not truncated uint8
-//   * All shared state touched from ISR is documented as such
+//  Identical to mesh_node.ino except setup() always forces my_id = GATEWAY_ID
+//  so this board becomes the gateway regardless of MY_ID in config.h.
 //
-//  All tunables are sourced from `config.h` (single source of truth, fixes
-//  the audit's D6 finding).  The packet structs and neighbour record come
-//  from `mesh_proto.h` so other tools (bridge script, test rigs) can share
-//  the wire format.
+//  Flash THIS file (with MeshDiagnostics.h, config.h, mesh_proto.h in the
+//  same sketch folder) on the board that should be the gateway — usually
+//  the one tethered to USB on the demo laptop.  Flash mesh_node.ino on
+//  every other board; set MY_ID per board via config.h.
 // =============================================================================
 
 #include <Arduino.h>
@@ -28,22 +19,15 @@
 #include "config.h"
 #include "mesh_proto.h"
 
-// =============================================================================
-//  BACKEND (HTTP POST)  — flip these two between local dev and Render prod.
-//    DEV  : laptop on OPPO K13 5G hotspot  -> http://100.127.255.148:4000/ingest
-//    PROD : Render free web service        -> https://aegis-mesh.onrender.com/ingest
-//  Render free-tier cold-starts take ~50 s; the timeout + retry below cover it.
-// =============================================================================
+// ---- Backend connection --------------------------------------------------
 const char* WIFI_SSID   = "OPPO K13 5G";                  // <-- Wi-Fi SSID
 const char* WIFI_PASS   = "12345678";                     // <-- Wi-Fi password
 const char* BACKEND_URL = "http://10.49.11.179:4000/ingest";
-const uint32_t HTTP_PERIOD_MS = 5000;                    // batch every 5 s
-const uint16_t HTTP_TIMEOUT_MS = 8000;                   // covers Render cold-start connect
-const uint8_t  HTTP_MAX_RETRIES = 3;                     // retries per batch on -1 / timeout
+const uint32_t HTTP_PERIOD_MS = 5000;
+const uint16_t HTTP_TIMEOUT_MS = 8000;
+const uint8_t  HTTP_MAX_RETRIES = 3;
 
-// =============================================================================
-//  1. BOARD PINS  (ESP32-WROOM-32 DevKit v1)
-// =============================================================================
+// ---- Pins (ESP32-WROOM-32 DevKit v1) -------------------------------------
 #define PIN_SENSOR_0          32
 #define PIN_SENSOR_1          33
 #define PIN_BATTERY_ADC       34
@@ -51,39 +35,34 @@ const uint8_t  HTTP_MAX_RETRIES = 3;                     // retries per batch on
 #define PIN_LED_ALERT         26
 #define PIN_BTN_BOOT           0
 
-// =============================================================================
-//  2. GLOBAL STATE  (some touched from ISR — see notes)
-// =============================================================================
+// ---- Globals -------------------------------------------------------------
 static const uint8_t BCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-uint8_t        my_id            = MY_ID;       // not const: boot button may override
+uint8_t        my_id            = MY_ID;
 uint8_t        my_role          = ROLE_SENSOR;
 uint8_t        my_battery       = 90;
 uint8_t        current_next_hop = 0xFF;
-uint8_t        route_mode       = 0;           // 0=RSSI, 1=ETX
+uint8_t        route_mode       = 0;
 RTC_DATA_ATTR uint32_t seq_counter = 0;
 
 neighbor_t neighbors[MAX_NEIGHBORS];
 uint8_t    n_neighbors = 0;
 
-// 3 priority queues (best-effort, reliable, critical)
 QueueHandle_t q_crit, q_rel, q_be;
 
 struct dedup_entry { uint32_t key; bool used; };
 static dedup_entry dedup[DEDUP_CACHE_SIZE];
-static uint8_t     dedup_head = 0;             // touched from ISR — 64-entry scan is ~µs
+static uint8_t     dedup_head = 0;
 
 struct anomaly_state {
     float mean, var;
     int   n, prev;
     bool  bootstrapped;
-    uint8_t last_flag;                         // set; consumed by tick_anomaly
+    uint8_t last_flag;
 };
 static anomaly_state anomaly_s0, anomaly_s1;
 
-// =============================================================================
-//  3. HELPERS
-// =============================================================================
+// ---- Helpers -------------------------------------------------------------
 static inline float clamp01(float v) {
     return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
@@ -102,8 +81,6 @@ static uint16_t crc16(const uint8_t *d, int n) {
     return c;
 }
 
-// uses 24 bits of seq + 8 bits of src → far fewer collisions than the old
-// (src << 16) | (seq & 0xFFFF) scheme once seq_counter climbs past 65k
 static bool dedup_seen(uint32_t key) {
     for (uint8_t i = 0; i < DEDUP_CACHE_SIZE; ++i)
         if (dedup[i].used && dedup[i].key == key) return true;
@@ -115,23 +92,19 @@ static inline uint32_t dedup_key(const mesh_pkt_t &p) {
     return ((uint32_t)p.src << 24) | ((p.seq >> 8) & 0x00FFFFFFu);
 }
 
-// =============================================================================
-//  4. NEIGHBOUR / PREDICTOR  (runs from ISR + main loop — see note)
-// =============================================================================
+// ---- Neighbour / predictor ----------------------------------------------
 static void add_peer(const uint8_t *mac) {
-    if (esp_now_is_peer_exist(mac)) return;     // idempotent
+    if (esp_now_is_peer_exist(mac)) return;
     esp_now_peer_info_t pi = {};
     memcpy(pi.peer_addr, mac, 6);
     pi.channel = 0; pi.encrypt = false;
     esp_now_add_peer(&pi);
 }
-static void del_peer(const uint8_t *mac) {
-    esp_now_del_peer(mac);
-}
+static void del_peer(const uint8_t *mac) { esp_now_del_peer(mac); }
 
 static void neighbor_update(const mesh_pkt_t &p, const uint8_t *mac) {
     if (p.type != HELLO) return;
-    if (p.src == my_id) return;                 // ignore our own HELLO echoed
+    if (p.src == my_id) return;
 
     uint8_t idx = 0xFF;
     for (uint8_t i = 0; i < n_neighbors; ++i)
@@ -159,7 +132,7 @@ static void neighbor_update(const mesh_pkt_t &p, const uint8_t *mac) {
 
     const hello_payload_t *hp = (const hello_payload_t *)p.payload;
     nb.battery    = hp->battery;
-    nb.hop_count  = hp->hop_count;              // for future multi-hop
+    nb.hop_count  = hp->hop_count;
     if (hp->etx_est_x10 > 0)
         nb.ewma_etx = (float)hp->etx_est_x10 / 10.0f;
 
@@ -169,7 +142,7 @@ static void neighbor_update(const mesh_pkt_t &p, const uint8_t *mac) {
     nb.hist_idx = (nb.hist_idx + 1) % 3;
     nb.ewma_rssi = now;
 
-    float slope = now - prev;                   // per-second slope
+    float slope = now - prev;
     nb.slope_hist[nb.slope_idx] = slope;
     nb.slope_idx = (nb.slope_idx + 1) % 3;
 
@@ -205,7 +178,6 @@ static void compute_costs_and_risk() {
         if (nb.ewma_etx > 2.0f) nb.risk = 1;
         if (nb.battery < BATTERY_LOW_THRESH) nb.risk = 1;
     }
-    // age out (iterate in reverse so remove_neighbor's shift is safe)
     uint32_t now = millis();
     for (int i = (int)n_neighbors - 1; i >= 0; --i) {
         if (now - neighbors[i].last_seen_ms > HELLO_DEAD_MS) {
@@ -224,7 +196,6 @@ static float edge_cost(const neighbor_t &nb) {
     else           return W_RSSI*rc + W_BATTERY*bc + W_HOPS*hc + W_RISK*rk;
 }
 
-// helper: local best-ETX for advertising in HELLO
 static float current_etx() {
     float best = 1.0f;
     for (uint8_t i = 0; i < n_neighbors; ++i)
@@ -232,10 +203,7 @@ static float current_etx() {
     return best;
 }
 
-// =============================================================================
-//  5. PMA* — 1-hop forward search. For multi-hop, extend the open set to
-//     neighbours-of-neighbours and use the hop_count field in HELLO.
-// =============================================================================
+// ---- PMA* ----------------------------------------------------------------
 struct a_node { uint8_t id; float g, f; uint8_t parent; bool opened, closed; };
 
 static uint8_t pma_next_hop(uint8_t src) {
@@ -286,7 +254,6 @@ static uint8_t pma_next_hop(uint8_t src) {
         if (c.closed) continue;
         c.closed = true;
         if (c.id == GATEWAY_ID) {
-            // backtrace: find the first hop from `src`
             uint8_t hop = c.parent;
             while (hop != 0xFF) {
                 int8_t pi = idx_of(hop);
@@ -314,9 +281,7 @@ static uint8_t pma_next_hop(uint8_t src) {
     return 0xFF;
 }
 
-// =============================================================================
-//  6. ANOMALY  (Welford online)
-// =============================================================================
+// ---- Anomaly -------------------------------------------------------------
 static uint8_t anomaly_push(anomaly_state &s, int x) {
     s.n++;
     float d = x - s.mean;
@@ -334,10 +299,8 @@ static uint8_t anomaly_push(anomaly_state &s, int x) {
     return flag;
 }
 
-// =============================================================================
-//  7. RADIO
-// =============================================================================
-static volatile bool last_send_ok = true;      // updated by onDataSent
+// ---- Radio ---------------------------------------------------------------
+static volatile bool last_send_ok = true;
 static void onDataSent(const wifi_tx_info_t *, esp_now_send_status_t st) {
     last_send_ok = (st == ESP_NOW_SEND_SUCCESS);
 }
@@ -359,22 +322,18 @@ static void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int
 }
 
 static void radio_init() {
-    // MUST be called AFTER WiFi is up — esp_now peer channel must match
-    // the channel the STA interface is currently on.
     if (esp_now_init() != ESP_OK) { Serial.println(F("esp_now fail")); return; }
     esp_now_register_send_cb(onDataSent);
     esp_now_register_recv_cb(onDataRecv);
     esp_now_peer_info_t bc = {};
     memcpy(bc.peer_addr, BCAST, 6);
-    bc.channel = (uint8_t)WiFi.channel();   // explicit channel = current STA channel
+    bc.channel = (uint8_t)WiFi.channel();
     bc.encrypt = false;
     esp_now_add_peer(&bc);
     Serial.printf("{\"espnow\":{\"ready\":true,\"ch\":%d}}\n", (int)WiFi.channel());
 }
 
 static void espnow_refresh_channel() {
-    // Re-add the broadcast peer against the live channel in case Wi-Fi
-    // roamed while connected.  Cheap and idempotent.
     uint8_t ch = (uint8_t)WiFi.channel();
     if (ch == 0) return;
     esp_now_del_peer(BCAST);
@@ -384,9 +343,7 @@ static void espnow_refresh_channel() {
     esp_now_add_peer(&bc);
 }
 
-// =============================================================================
-//  8. FORWARDING + BUFFER + ACK
-// =============================================================================
+// ---- Forwarding + buffer + ACK ------------------------------------------
 static void send_unicast(uint8_t next_id, const mesh_pkt_t &p) {
     for (uint8_t i = 0; i < n_neighbors; ++i)
         if (neighbors[i].id == next_id) {
@@ -405,7 +362,6 @@ static void process_queue(QueueHandle_t q) {
         if (p.ttl == 0) continue;
         p.ttl--;
 
-        // ---- ACK arrives — count it on the original sender link ----
         if (p.type == ACK) {
             for (uint8_t i = 0; i < n_neighbors; ++i)
                 if (neighbors[i].id == p.src) { neighbors[i].ack_cnt++; break; }
@@ -424,7 +380,6 @@ static void process_queue(QueueHandle_t q) {
             continue;
         }
 
-        // use cached route; only re-search on CRITICAL or no-cache
         uint8_t nh = (p.prio == CRITICAL) ? pma_next_hop(my_id) : current_next_hop;
         if (nh == 0xFF || nh == my_id) {
             File f = LittleFS.open(BUFFER_FILE, "a");
@@ -450,7 +405,7 @@ static void drain_buffer() {
         if (nh != 0xFF && nh != my_id) {
             send_unicast(nh, p);
         } else {
-            dst.write((uint8_t*)&p, sizeof(p));   // keep the unsent tail
+            dst.write((uint8_t*)&p, sizeof(p));
         }
     }
     src.close(); dst.close();
@@ -458,19 +413,13 @@ static void drain_buffer() {
     LittleFS.rename(BUFFER_TMP, BUFFER_FILE);
 }
 
-// =============================================================================
-//  9. SCHEDULER TICKS
-// =============================================================================
+// ---- Scheduler ticks -----------------------------------------------------
 static void read_battery() {
     uint32_t sum = 0;
     for (int i = 0; i < 16; ++i) sum += analogRead(PIN_BATTERY_ADC);
     uint32_t raw = sum / 16;
-    // If the divider is unconnected (USB-powered desktop test), the ADC
-    // floats to ~0. Treat anything below a small noise floor as "USB"
-    // and report 100% so neighbour cost functions don't mark us as
-    // risky and refuse to route through us.
     if (raw < 50) { my_battery = 100; return; }
-    float v = (float)raw / 4095.0f * 3.3f * 2.0f;   // 1/2 divider
+    float v = (float)raw / 4095.0f * 3.3f * 2.0f;
     int pct = (int)((v - 3.0f) / 1.2f * 100.0f);
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     my_battery = (uint8_t)pct;
@@ -487,7 +436,7 @@ static void tick_heartbeat() {
     hello_payload_t hp = {};
     hp.battery     = my_battery;
     hp.role        = my_role;
-    hp.etx_est_x10 = (uint8_t)(current_etx() * 10);   // was hard-coded to 10
+    hp.etx_est_x10 = (uint8_t)(current_etx() * 10);
     hp.hop_count   = (my_id == GATEWAY_ID) ? 0
                       : (current_next_hop == 0xFF ? 255 : 1);
     memcpy(p.payload, &hp, sizeof(hp));
@@ -527,7 +476,6 @@ static void tick_anomaly() {
 }
 
 static void tick_telemetry() {
-    // build JSON in one buffer to avoid Serial.printf-per-neighbour overhead
     String s;
     s.reserve(256 + n_neighbors * 80);
     s  = F("{\"id\":");    s += my_id;
@@ -541,7 +489,7 @@ static void tick_telemetry() {
         if (i) s += ',';
         s += F("{\"id\":");    s += neighbors[i].id;
         s += F(",\"rssi\":");  s += neighbors[i].rssi;
-        s += F(",\"etx\":");   s += String(neighbors[i].ewma_etx, 1);  // float, not truncated
+        s += F(",\"etx\":");   s += String(neighbors[i].ewma_etx, 1);
         s += F(",\"bat\":");   s += neighbors[i].battery;
         s += F(",\"risk\":");  s += neighbors[i].risk;
         s += F(",\"hop\":");   s += neighbors[i].hop_count;
@@ -553,18 +501,10 @@ static void tick_telemetry() {
 
 static void tick_role() {
     if (my_id == GATEWAY_ID) { my_role = ROLE_GW; return; }
-    // simple heuristic — a real election would weigh battery and link quality
     my_role = (n_neighbors >= 3) ? ROLE_RELAY : ROLE_SENSOR;
 }
 
-// =============================================================================
-//  10. BACKEND HTTP PUSH  (gateway-only; batches telemetry JSON to BACKEND_URL)
-//
-//  HTTPS supported: when BACKEND_URL starts with https:// we use
-//  WiFiClientSecure with the ESP32 x509 CA bundle (the public cert chain
-//  for *.onrender.com is built in).  Local-dev http:// still uses the
-//  plain WiFiClient path so a phone-hotspot laptop URL keeps working.
-// =============================================================================
+// ---- Backend HTTP push ---------------------------------------------------
 static String  http_buf;
 static uint16_t http_count = 0;
 static uint32_t http_last_fail_log_ms = 0;
@@ -572,22 +512,15 @@ static uint32_t http_last_fail_log_ms = 0;
 static bool url_is_https() { return strncmp(BACKEND_URL, "https://", 8) == 0; }
 
 static void http_diag_once() {
-    // print the resolved scheme + host once so we can see whether the URL
-    // parsed cleanly and which transport we're using.
     const char* scheme = url_is_https() ? "https" : "http";
     Serial.printf("[http] scheme=%s target=%s\n", scheme, BACKEND_URL);
 }
 
 static int http_post_once(const String &body) {
-    // Returns HTTP status code on success (200/204), or -1 on connect/timeout.
     HTTPClient http;
     if (url_is_https()) {
         WiFiClientSecure sec;
-        sec.setInsecure();           // Render uses a public cert; the ESP32
-        // CA bundle is large. setInsecure() skips chain validation which
-        // is acceptable for telemetry POSTs (server auth is via URL).
-        // If you'd rather pin it, set the Render CA via
-        // sec.setCACert(BACKEND_CA) — see config.h.
+        sec.setInsecure();
         http.begin(sec, BACKEND_URL);
     } else {
         WiFiClient plain;
@@ -617,10 +550,7 @@ static void http_push_now() {
     int code = -1;
     for (uint8_t attempt = 1; attempt <= HTTP_MAX_RETRIES && code <= 0; ++attempt) {
         code = http_post_once(http_buf);
-        if (code <= 0 && attempt < HTTP_MAX_RETRIES) {
-            // Render cold-start can take ~50 s; back off before retrying.
-            delay(1500 * attempt);
-        }
+        if (code <= 0 && attempt < HTTP_MAX_RETRIES) delay(1500 * attempt);
     }
 
     uint32_t now = millis();
@@ -667,15 +597,12 @@ static void tick_http() {
     http_count++;
 }
 
-// =============================================================================
-//  11. SETUP / LOOP
-// =============================================================================
-#include "MeshDiagnostics.h"   // MUST come AFTER enums/typedefs/globals/helpers
+#include "MeshDiagnostics.h"
 
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println(F("mesh_node booting…"));
+    Serial.println(F("mesh_node (gateway) booting…"));
 
     pinMode(PIN_LED_OK,    OUTPUT);
     pinMode(PIN_LED_ALERT, OUTPUT);
@@ -683,17 +610,14 @@ void setup() {
     analogReadResolution(12);
     digitalWrite(PIN_LED_OK, HIGH);
 
-    // ---- Boot button held at reset → force this board to be the gateway ----
-    if (digitalRead(PIN_BTN_BOOT) == LOW) {
-        Serial.printf("{\"boot_btn\":\"gateway-forced\",\"my_id_was\":%u}\n", MY_ID);
-        my_id    = GATEWAY_ID;
-        my_role  = ROLE_GW;
-    }
+    // ---- GATEWAY VARIANT: force gateway id regardless of MY_ID ----
+    my_id   = GATEWAY_ID;
+    my_role = ROLE_GW;
+    Serial.printf("{\"boot\":{\"forced_gateway\":true,\"my_id\":%u}}\n", my_id);
 
     read_battery();
     if (!LittleFS.begin()) Serial.println(F("FS fail"));
 
-    // ---- Wi-Fi first, so esp_now peer channel matches the live channel ----
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.printf("{\"wifi\":{\"ssid\":\"%s\",\"connecting\":true}}\n", WIFI_SSID);
@@ -710,14 +634,12 @@ void setup() {
     q_crit = xQueueCreate(16, sizeof(mesh_pkt_t));
     q_rel  = xQueueCreate(32, sizeof(mesh_pkt_t));
     q_be   = xQueueCreate(32, sizeof(mesh_pkt_t));
-    radio_init();                         // now reads the live Wi-Fi channel
-    my_role = (my_id == GATEWAY_ID) ? ROLE_GW : ROLE_SENSOR;
-    if (my_role == ROLE_GW) http_diag_once();
+    radio_init();
+    my_role = ROLE_GW;
+    http_diag_once();
 
-    Serial.printf("{\"boot\":{\"id\":%u,\"role\":%u,\"bat\":%u,"
-                  "\"ch\":%d,\"pin_s0\":%u,\"pin_s1\":%u}}\n",
-                  my_id, my_role, my_battery,
-                  (int)WiFi.channel(), PIN_SENSOR_0, PIN_SENSOR_1);
+    Serial.printf("{\"boot\":{\"id\":%u,\"role\":%u,\"bat\":%u,\"ch\":%d}}\n",
+                  my_id, my_role, my_battery, (int)WiFi.channel());
 }
 
 uint32_t last_hb = 0, last_cost = 0, last_telem = 0,
@@ -727,12 +649,10 @@ uint32_t last_hb = 0, last_cost = 0, last_telem = 0,
 void loop() {
     uint32_t now = millis();
 
-    // CRITICAL is drained first, every iteration
     process_queue(q_crit);
     process_queue(q_rel);
     process_queue(q_be);
 
-    // keep ESP-NOW peers in sync with the Wi-Fi channel (e.g. after roam)
     static uint8_t last_ch = 0xFF;
     uint8_t ch = (uint8_t)WiFi.channel();
     if (ch && ch != last_ch) {
@@ -751,7 +671,6 @@ void loop() {
     if (now - last_telem >= 1000)              { tick_telemetry();   last_telem = now; }
     if (now - last_bat   >= 30000)             { read_battery();     last_bat   = now; }
 
-    // backend HTTP push (gateway only): batch every HTTP_PERIOD_MS
     if (my_role == ROLE_GW) {
         tick_http();
         if (now - last_http >= HTTP_PERIOD_MS) {
@@ -760,7 +679,6 @@ void loop() {
         }
     }
 
-    // serial command: MODE:RSSI / MODE:ETX (non-blocking line parse)
     static String line;
     while (Serial.available()) {
         char c = (char)Serial.read();

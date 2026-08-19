@@ -15,10 +15,77 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+
+// ESP32 gateway → server ingestion. The firmware batches a newline-delimited
+// stream of {node, role, bat, nb, route, mode, rssi, nbrs:[{id,rssi,etx,bat,risk}]}
+// records (one per gateway telemetry tick). We forward each as a single
+// live snapshot into the WebSocket so the dashboard renders real data.
+const INGEST_BODY_LIMIT = '256kb';
+
+function espIngestTick(rec, n) {
+    // Translate a single {node,role,...} record into the {cmd:'tick',nodes,edges}
+    // shape the dashboard already consumes.
+    const nodeId = rec.node | 0;
+    const role   = rec.role | 0;
+    const nbrs   = Array.isArray(rec.nbrs) ? rec.nbrs : [];
+    const etx    = (rec.nbrs && rec.nbrs[0] && rec.nbrs[0].etx) ? rec.nbrs[0].etx : 1.0;
+
+    // Position: pin the gateway at the left edge, distribute the rest in a
+    // deterministic circle. The dashboard already overrides via /positions.json.
+    if (!n.byId.has(nodeId)) {
+        const total = Math.max(1, rec.nb | 0 || nbrs.length || 1);
+        const ang = (n.byId.size / total) * Math.PI * 2;
+        n.byId.set(nodeId, {
+            id: nodeId,
+            x: role === 2 ? 110 : (340 + Math.cos(ang) * 230),
+            y: role === 2 ? 210 : (180 + Math.sin(ang) * 140),
+            isGateway: role === 2,
+            role, battery: rec.bat | 0, anomaly: false,
+            route_mode: rec.mode | 0,
+        });
+        n.order.push(nodeId);
+    } else {
+        const cur = n.byId.get(nodeId);
+        cur.role = role;
+        cur.battery = rec.bat | 0;
+        cur.route_mode = rec.mode | 0;
+    }
+
+    // Map neighbour records to edges (a-b keyed, deduped).
+    const node = n.byId.get(nodeId);
+    for (const nb of nbrs) {
+        const a = Math.min(nodeId, nb.id | 0);
+        const b = Math.max(nodeId, nb.id | 0);
+        const k = `${a}-${b}`;
+        if (n.edgeSeen.has(k)) continue;
+        n.edgeSeen.add(k);
+        const rssi = (nb.rssi | 0);
+        const etx1 = (nb.etx != null) ? Number(nb.etx) : 1.0;
+        n.edges.push({
+            a, b,
+            rssi,
+            rssiEma: rssi,
+            forecast: rssi,
+            pEma: 1 / Math.max(0.05, etx1),
+            risk: (nb.risk | 0) ? 1 : 0,
+            interfered: false,
+            history: [rssi],
+            label: `${rssi}dBm / etx ${etx1.toFixed(2)}`,
+        });
+    }
+
+    // Keep node history in sync so the dashboard's per-edge coloring still
+    // has data points to plot when the simulation hasn't been run.
+    void etx;
+    return node;
+}
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
+const PUBLIC_DIR = join(ROOT, 'public');
+const IS_RENDER = !!process.env.RENDER || !!process.env.RENDER_EXTERNAL_URL;
 
 const args = Object.fromEntries(
   process.argv.slice(2).reduce((acc, cur, i, arr) => {
@@ -28,6 +95,23 @@ const args = Object.fromEntries(
 );
 const HTTP_PORT = parseInt(args['port-http'] || process.env.PORT || '4000', 10);
 const TICK_MS = parseInt(args['tick'] || '1200', 10);   // slow down per request
+
+// Comma-separated list of allowed origins for the SPA → /ws handshake.
+// In production this is your Render URL (and its www variant). In dev, allow
+// the Vite origin and same-host. Wildcard `*` is used only when explicitly
+// opted in (handy for a quick LAN ESP32 test).
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
+  (IS_RENDER
+    ? [process.env.RENDER_EXTERNAL_URL, `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`].filter(Boolean).join(',')
+    : 'http://localhost:3000,http://127.0.0.1:3000')
+).split(',').map((s) => s.trim()).filter(Boolean);
+const ALLOW_ALL_ORIGINS = process.env.ALLOW_ALL_ORIGINS === '1' || ALLOWED_ORIGINS.includes('*');
+
+function isOriginAllowed(origin) {
+  if (!origin) return true; // native apps (ESP32 / curl) send no Origin
+  if (ALLOW_ALL_ORIGINS) return true;
+  return ALLOWED_ORIGINS.includes(origin);
+}
 
 const CLIENTS = new Set();
 
@@ -214,10 +298,141 @@ regen(state.nodeCount);
 
 // ===== HTTP + WS =====
 const app = express();
-app.use(express.static(ROOT));  // serves /positions.json etc.
+
+// Render (and most PaaS) terminate TLS at an edge proxy and forward X-Forwarded-*
+// to the app. Trust the first hop so req.ip / secure() reflect the real client.
+// In dev we run direct, so leave trust-proxy off.
+if (IS_RENDER) app.set('trust proxy', 1);
+
+// Lightweight CORS for the /ws handshake and any REST. Browsers require an
+// explicit Access-Control-Allow-Origin to upgrade a cross-origin WS.
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (isOriginAllowed(origin)) {
+    if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// Health probe — Render uses this; cheap and idempotent.
+app.get('/healthz', (_req, res) => {
+  res.json({ ok: true, tickMs: TICK_MS, nodes: nodes.length, edges: edges.length });
+});
+
+// ---- ESP32 /ingest ------------------------------------------------------
+// Body is a batch of newline-delimited JSON records:
+//     {"node":2,"role":1,"bat":87,"nb":3,"route":4,"mode":0,"rssi":-58,
+//      "nbrs":[{"id":0,"rssi":-62,"etx":1.1,"bat":99,"risk":0}, ...]}
+//     {"node":4,...}\n
+// We translate each into the {cmd:'tick',nodes,edges} shape the dashboard
+// already speaks and broadcast it on /ws so real ESP32 telemetry replaces
+// the simulator until the next sim tick overwrites it.
+app.use('/ingest', express.text({ type: '*/*', limit: INGEST_BODY_LIMIT }));
+
+// Live state from real hardware. The simulator continues to broadcast on
+// its own TICK_MS cadence; the ESP32 snapshots sit on top.
+const LIVE = {
+    byId: new Map(),
+    order: [],
+    edges: [],
+    edgeSeen: new Set(),
+    lastSeen: 0,
+};
+
+function liveSnapshot() {
+    const list = LIVE.order.map((id) => LIVE.byId.get(id));
+    return {
+        cmd: 'tick',
+        tick: ++tickN,
+        src: 0,
+        target: 0,
+        pinned: false,
+        tickMs: TICK_MS,
+        nodes: list.map((n) => ({ ...n, history: undefined })),
+        edges: LIVE.edges.map((e) => ({ ...e })),
+        live: true,
+    };
+}
+
+app.post('/ingest', (req, res) => {
+    const body = req.body || '';
+    if (!body.length) return res.status(204).end();
+    const lines = String(body).split('\n').map((l) => l.trim()).filter(Boolean);
+    let parsed = 0, skipped = 0;
+    for (const line of lines) {
+        let rec;
+        try { rec = JSON.parse(line); }
+        catch { skipped++; continue; }
+        if (typeof rec !== 'object' || rec === null || rec.node == null) { skipped++; continue; }
+        espIngestTick(rec, LIVE);
+        parsed++;
+    }
+    LIVE.lastSeen = Date.now();
+    if (parsed) {
+        const snap = liveSnapshot();
+        // Push to every WS client. Replaces the simulator's snapshot on
+        // this tick for any browser that has `live` clients, so the
+        // dashboard reflects real radio state immediately.
+        const data = JSON.stringify(snap);
+        for (const ws of CLIENTS) {
+            if (ws.readyState === ws.OPEN) {
+                try { ws.send(data); } catch {}
+            }
+        }
+    }
+    res.json({ ok: true, parsed, skipped });
+});
+
+// Serve the React build (web → /public) if it exists. In dev, Vite owns /.
+// In Render production, `npm run build` populates public/ and we serve it here.
+if (existsSync(PUBLIC_DIR)) {
+  app.use(express.static(PUBLIC_DIR, { maxAge: '5m', index: 'index.html' }));
+  // Anything that isn't /ws /api /healthz /positions.json falls back to the SPA.
+  app.get(/^\/(?!ws$|api|healthz|positions\.json).*/, (_req, res, next) => {
+    const indexFile = join(PUBLIC_DIR, 'index.html');
+    if (!existsSync(indexFile)) return next();
+    res.setHeader('Cache-Control', 'no-cache');
+    res.send(readFileSync(indexFile));
+  });
+}
+
+// Useful for the dashboard's optional fixed-layout file.
+app.get('/positions.json', (_req, res) => {
+  const f = join(ROOT, 'positions.json');
+  if (!existsSync(f)) return res.json({});
+  res.type('application/json').send(readFileSync(f));
+});
+
+// Generic static fallback for non-React assets (positions.json at root, etc.).
+app.use(express.static(ROOT));
 
 const httpServer = createServer(app);
-const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+
+// WebSocket server. We attach to the same HTTP server but route the
+// Upgrade event ourselves — that lets us enforce the Origin allow-list
+// and also keeps the path explicit, which helps when Render terminates
+// the TLS connection.
+const wss = new WebSocketServer({ noServer: true });
+
+httpServer.on('upgrade', (req, socket, head) => {
+  if (req.url !== '/ws' && req.url !== '/ws/') {
+    socket.destroy();
+    return;
+  }
+  if (!isOriginAllowed(req.headers.origin)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
 
 wss.on('connection', (ws) => {
   CLIENTS.add(ws);
@@ -256,9 +471,21 @@ function broadcast(obj) {
   }
 }
 
-setInterval(() => broadcast(snapshot()), TICK_MS);
+setInterval(() => {
+    // Once the ESP32 is talking, suspend the simulator so real telemetry
+    // stays visible. Resume 60 s after the last ingest.
+    const liveFresh = LIVE.lastSeen && (Date.now() - LIVE.lastSeen < 60000);
+    if (liveFresh && LIVE.order.length) return;
+    broadcast(snapshot());
+}, TICK_MS);
 
 httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
-  console.log(`[http] serving on http://localhost:${HTTP_PORT}`);
-  console.log(`[ws]   WebSocket at ws://localhost:${HTTP_PORT}/ws  (tick ${TICK_MS}ms)`);
+  const secure = IS_RENDER;
+  const proto = secure ? 'https' : 'http';
+  const wsProto = secure ? 'wss' : 'ws';
+  const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${HTTP_PORT}`;
+  console.log(`[http] serving on ${proto}://${host}`);
+  console.log(`[ws]   WebSocket at ${wsProto}://${host}/ws  (tick ${TICK_MS}ms)`);
+  if (ALLOW_ALL_ORIGINS) console.log('[cors] ALLOW_ALL_ORIGINS=1 — every Origin accepted');
+  else console.log(`[cors] allowed origins: ${ALLOWED_ORIGINS.join(', ') || '(none)'}`);
 });

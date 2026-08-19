@@ -1,0 +1,26 @@
+# Render blueprint — single Node service that builds the SPA, serves it
+# statically, and runs the WS simulator that ESP32 boards can hit.
+#
+# `npm run build` (root) installs web deps and runs `vite build` → ../public.
+# `npm run start` then starts `server/server.js`, which serves both REST/WS
+# and the built SPA from the same port (Render forwards 443 → $PORT).
+
+services:
+  - type: web
+    name: aegis-mesh
+    runtime: node
+    plan: free
+    rootDir: .
+    buildCommand: npm run build
+    startCommand: npm run start
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20.11.1
+      # Optional — leave unset to auto-allow the Render origin only.
+      # - key: ALLOWED_ORIGINS
+      #   value: https://aegis-mesh.onrender.com
+      # LAN-only dev with ESP32? Set this so any device may connect:
+      # - key: ALLOW_ALL_ORIGINS
+      #   value: "1"

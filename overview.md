@@ -349,6 +349,16 @@ This line‑delimited JSON stream is the source for the **bridge** script.
 3. Broadcasts the parsed object to all connected WebSocket clients (the dashboard).
 4. Listens for inbound WebSocket commands (e.g., `{"cmd":"set_mode","mode":"ETX"}`) and writes the corresponding serial command (`MODE:ETX\n`) back to the gateway.
 
+### Hosting on Render (single Node service)
+
+The backend in `server/server.js` is Render‑aware: it detects `RENDER` / `RENDER_EXTERNAL_URL` and serves both the WS API and the React build from the same port. Render's edge terminates TLS and forwards `X‑Forwarded‑*` to `$PORT`, so `app.set('trust proxy', 1)` makes `req.ip` correct.
+
+- Deploy: `render.yaml` declares one `web` service, builds with `npm run build` (root → installs `web/`, runs `vite build` → `public/`), and starts `npm run start` (`server/server.js`). Health probe at `GET /healthz`.
+- CORS: `ALLOWED_ORIGINS` is auto‑seeded with `RENDER_EXTERNAL_URL` in production. The Vite dev server is whitelisted by default for local work. Browsers must send the correct `Origin` header on the WS handshake; the ESP32 bridge / native clients (no `Origin`) are always allowed.
+- ESP32 → Render: the gateway (or its bridge) dials `wss://<service>.onrender.com/ws`. No port forwarding needed on the device side — Render exposes 443 publicly.
+- Wide‑open mode for LAN demos: set `ALLOW_ALL_ORIGINS=1`. Use it only on a private network.
+- For a real deployment, point the bridge (or `mesh_proto.h`'s hard‑coded URL) at the Render `wss://…` URL instead of `ws://<laptop‑IP>:8765`.
+
 ### Dashboard (HTML/JS)
 - Re‑uses the canvas‑based rendering from `mesh_route_sim.html`.
 - Consumes the WebSocket stream, draws nodes at positions from `positions.json`, colours links by live RSSI (blue) and ETX (green), and highlights the current best path.

@@ -1,16 +1,18 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-// Dev: Vite on :5173, Express on :8080. Proxy WS + REST.
+// Dev: Vite on :3000, Express on :4000. Proxy WS + REST.
+// In production the backend serves the built SPA from /public on the same port.
 export default defineConfig({
   plugins: [react()],
   server: {
     port: 3000,
     host: true,
     proxy: {
-      '/api': 'http://localhost:4000',
-      '/ws':  { target: 'ws://localhost:4000', ws: true },
-      '/positions.json': 'http://localhost:4000',
+      '/api':           { target: 'http://localhost:4000', changeOrigin: true },
+      '/healthz':       { target: 'http://localhost:4000', changeOrigin: true },
+      '/ws':            { target: 'ws://localhost:4000',  ws: true, changeOrigin: true },
+      '/positions.json':{ target: 'http://localhost:4000', changeOrigin: true },
     },
   },
   build: {
